@@ -1,11 +1,11 @@
-from vowpalwabbit import pyvw
-
 import pandas as pd
 import requests
 import math
 import streamlit as st
 import time
 from sklearn.metrics import mean_squared_error
+from river import linear_model, preprocessing, compose, metrics
+import plotly.graph_objects as go
 
 # Step 1: ดึงข้อมูล BTC จาก Binance (ปรับเป็น 1 นาที)
 def get_binance_klines(symbol="BTCUSDT", interval="1m", limit=200):
@@ -33,29 +33,8 @@ def prepare_data(df):
     df = df.dropna()
     return df
 
-# Step 3: แปลงเป็น VW format
-def to_vw_format(row):
-    return f"{row['label']} |f close:{row['close']} volume:{row['volume']} ma_diff:{row['ma_diff']}"
-
-# Step 4: เทรนโมเดลใน Python
-def train_vw_model(df):
-    model = pyvw.Workspace("--loss_function=logistic")
-    for i in range(len(df)):
-        line = to_vw_format(df.iloc[i])
-        ex = model.example(line)
-        model.learn(ex)
-    return model
-
-# Step 5: ทำนายตัวอย่างใหม่ (พร้อม sigmoid)
-def predict(model, close, volume, ma_diff):
-    line = f"|f close:{close} volume:{volume} ma_diff:{ma_diff}"
-    ex = model.example(line)
-    logit = model.predict(ex)
-    prob = 1 / (1 + math.exp(-logit))
-    return prob
-
 # Streamlit Dashboard
-st.title("📈 Real-Time BTC Sentiment Prediction (1-min interval) with VW")
+st.title("📈 Real-Time BTC Sentiment Prediction (1-min interval) with River")
 st.caption("Updated every 60 seconds")
 
 placeholder = st.empty()
@@ -67,7 +46,12 @@ while True:
         update_count += 1
         df = get_binance_klines()
         df = prepare_data(df)
-        model = train_vw_model(df)
+
+        model = compose.Pipeline(
+            preprocessing.StandardScaler(),
+            linear_model.LogisticRegression()
+        )
+        metric = metrics.LogLoss()
 
         y_true = []
         y_pred = []
@@ -78,21 +62,34 @@ while True:
 
         for i in range(len(df)):
             row = df.iloc[i]
-            prob_up = predict(model, row["close"], row["volume"], row["ma_diff"])
-            y_true.append(row["label"])
-            y_pred.append(prob_up)
+            x = {
+                "close": row["close"],
+                "volume": row["volume"],
+                "ma_diff": row["ma_diff"]
+            }
+            y = row["label"]
+            y_prob = model.predict_proba_one(x).get(True, 0.5)
+            model = model.learn_one(x, y)
+
+            y_true.append(y)
+            y_pred.append(y_prob)
             label_texts.append(row["label_text"])
             actual_prices.append(row["future_close"])
-            predicted_price = row["close"] * (1 + 0.01 * (2 * prob_up - 1))
+            predicted_price = row["close"] * (1 + 0.01 * (2 * y_prob - 1))
             predicted_prices.append(predicted_price)
 
         mse = mean_squared_error(y_true, y_pred)
         mse_list = [mse] * len(df)
 
         latest = df.iloc[-1]
-        pred = predict(model, latest["close"], latest["volume"], latest["ma_diff"])
+        latest_x = {
+            "close": latest["close"],
+            "volume": latest["volume"],
+            "ma_diff": latest["ma_diff"]
+        }
+        latest_pred = model.predict_proba_one(latest_x).get(True, 0.5)
 
-        st.metric("🔮 Prob. price going UP (latest 1-min)", f"{pred:.4f}")
+        st.metric("🔮 Prob. price going UP (latest 1-min)", f"{latest_pred:.4f}")
         st.metric("📉 MSE (training set)", f"{mse:.6f}")
         st.metric("🔄 Update count", update_count)
 
@@ -105,13 +102,12 @@ while True:
             "MSE": mse_list[-len(y_pred):]
         })
 
-        import plotly.graph_objects as go
-
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=chart_df["Time"], y=chart_df["Actual Price"], name="Actual Price"))
         fig.add_trace(go.Scatter(x=chart_df["Time"], y=chart_df["Predicted Price"], name="Predicted Price"))
-        fig.update_layout(title="BTC Price Prediction", yaxis_range=[102000, 105000], xaxis_title="Time", yaxis_title="Price")
+        fig.update_layout(title="BTC Price Prediction", yaxis_range=[103800, 104400], xaxis_title="Time", yaxis_title="Price")
         st.plotly_chart(fig, use_container_width=True)
+
         st.dataframe(chart_df.tail(10))
 
     for i in range(60, 0, -1):
